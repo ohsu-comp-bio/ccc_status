@@ -13,18 +13,41 @@ import socket
 import subprocess
 import sys
 import time
+import types
 import xml.etree.ElementTree as ET
 
 import ccc_client
 
-argparser = argparse.ArgumentParser()
-argparser.add_argument("--status-count", action="store_true")
-argparser.add_argument("--only-finished", action="store_true")
-argparser.add_argument("--query", nargs="+")
-argparser.add_argument("--jobs", nargs="+")
+epilog="""
+Available query keys:
+  id          : Short ID e.g. abcd0983
+  full_id     : Full UUID
+  status      : Condor status
+  rc          : Return code
+  rc_time     : Timestamp on the rc file
+  path        : Filesystem path to the Cromwell execution directory
+  stdout      : Full stdout content
+  stderr      : Full stderr content
+  stdout_tail : Last 20 lines of stdout
+  stderr_tail : Last 20 lines of stderr
+  time        : Time taken from start to finish, calculated from Cromwell events.
+  condor_id   : Condor job ID.
+  condor_meta : Dump all Condor job metadata.
+  sep         : Line separator, useful when dumping stdout for many jobs.
+  nl          : Newline.
+"""
+
+argparser = argparse.ArgumentParser(
+    usage="%(prog)s job-info.json... --query key...",
+    epilog=epilog,
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+)
+argparser.add_argument("--summary", "-s", action="store_true")
+argparser.add_argument("--only-finished", "-f", action="store_true")
+argparser.add_argument("--query", "-q", nargs="+")
+argparser.add_argument("jobs", nargs="+")
 
 exec_engine_api = ccc_client.ExecEngineRunner()
-EXEC_DIR = "/cluster_share/cromwell-executions"
 
 CONDOR_STATUS_CODES = {
     "0": "Unexpanded",
@@ -35,14 +58,6 @@ CONDOR_STATUS_CODES = {
     "5": "Held",
     "6": "Submission_err",
 }
-
-def job_path(job_id, *args):
-    meta = exec_engine_api.get_metadata(job_id).json()
-    # TODO currently this only handles a single "call"
-    calls = meta['calls'].keys()
-    call_name = 'call-' + calls[0].split('.')[-1]
-    workflow_name = meta['workflowName']
-    return os.path.join(EXEC_DIR, workflow_name, job_id, call_name, *args)
 
 def get_condor_info():
     output = subprocess.check_output("condor_q -long", shell=True).strip()
@@ -78,39 +93,13 @@ def load_job_configs(paths):
 
     return job_configs
 
-def job_output_file(job_id, file_name):
-    p = job_path(job_id, file_name)
-    with open(p) as fh:
-        return fh.read()
-
-def job_rc(job_id):
-    rc_path = job_path(job_id, "rc")
-    has_rc = os.path.exists(rc_path)
-
-    if has_rc:
-        with open(rc_path) as fh:
-            return int(fh.read().strip())
-
-def job_rc_time(job_id):
-    rc_path = job_path(job_id, "rc")
-    has_rc = os.path.exists(rc_path)
-
-    if has_rc:
-        mtime = os.path.getmtime(rc_path)
-        return time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime(mtime))
-
-def did_job_fail(job_id):
-    rc = job_rc(job_id)
-    return rc is not None and rc != 0
-
 def tail(string, n=20):
     lines = string.split("\n")
     return "\n".join(lines[-n:])
 
-def job_cromwell_log(job_id):
-    meta = exec_engine_api.get_metadata(job_id).json()
-    workflow_name = meta['workflowName']
-    return job_output_file(job_id, workflow_name + '.log')
+
+class NoJobOutputFile(Exception): pass
+
 
 def parse_event_log(raw):
     events = []
@@ -146,31 +135,15 @@ def parse_event_log(raw):
 
     return events
 
-def cromwell_events(job_id):
-    log_content = job_cromwell_log(job_id)
-    # The ccc/cromwell output doesn't have a proper root element,
-    # so give it one, which makes parsing easier.
-    log_content = '<root>' + log_content + '</root>'
-    events = parse_event_log(log_content)
-    return events
 
-def time_taken(job_id, events):
-    start_event = None
-    end_event = None
+def print_job_status_summary(job_ids, condor_jobs_info):
+    counts = Counter()
+    for job_id in job_ids:
+        job_info = condor_jobs_info[job_id]
+        job_status = job_info['JobStatus']
+        counts[job_status] += 1
 
-    for event in events:
-        if event['MyType'] == 'SubmitEvent':
-            start_event = event
-        elif event['MyType'] == 'JobTerminatedEvent':
-            end_event = event
-
-    if not end_event:
-        return 'Still running'
-
-    dt_format = '%Y-%m-%dT%H:%M:%S'
-    start_time = datetime.strptime(start_event['EventTime'], dt_format)
-    end_time = datetime.strptime(end_event['EventTime'], dt_format)
-    return end_time - start_time
+    print counts
 
 
 ################################################################
@@ -193,15 +166,6 @@ def print_failed_job_config_path(job_configs):
         if did_job_fail(job_id):
             #print job_id, config_path
             print config_path
-
-def print_job_status_summary(job_ids, condor_jobs_info):
-    counts = Counter()
-    for job_id in job_ids:
-        job_info = condor_jobs_info[job_id]
-        job_status = job_info['JobStatus']
-        counts[job_status] += 1
-
-    print counts
 
 def print_tail_running_jobs(job_id, condor_jobs_info):
     job_info = condor_jobs_info[job_id]
@@ -234,84 +198,187 @@ def adhoc(job_ids, condor_jobs_info):
         #print_tail_running_jobs(job_id, condor_jobs_info)
         #print job_output_file(job_id, "Seqware_Sanger_Somatic_Workflow.log")
         #print_failed_job_stderr(job_id)
-        events = cromwell_events(job_id)
-        print time_taken(job_id, events)
         pass
 
 ################################################################
 
 class Job(object):
-    def __init__(self, id, condor_info):
-        self.id = id
-        if condor_info is not None:
-            self.condor_info = condor_info
-        else:
-            self.condor_info = {}
+    def __init__(self, id, condor_info, meta):
+        self.full_id = id
+        self.condor_info = condor_info or {}
+        self.meta = meta or {}
 
-    @property
-    def short_id(self):
-        return self.id[:8]
+    def id(self):
+        return self.full_id[:8]
 
-    @property
     def status(self):
         return self.condor_info.get('JobStatus', 'Unknown')
 
-    @property
     def rc(self):
-        return job_rc(self.id)
+        rc_path = self.path(self.full_id, "rc")
+        has_rc = os.path.exists(rc_path)
 
-    @property
+        if has_rc:
+            with open(rc_path) as fh:
+                return int(fh.read().strip())
+
     def rc_time(self):
-        return job_rc_time(self.id)
+        rc_path = self.path("rc")
+        has_rc = os.path.exists(rc_path)
 
-    @property
-    def path(self):
-        return job_path(self.id)
+        if has_rc:
+            mtime = os.path.getmtime(rc_path)
+            return time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime(mtime))
 
-    @property
+    def output_file(self, file_name):
+        p = self.path(file_name)
+        with open(p) as fh:
+            return fh.read()
+
+    def failed(self):
+        return self.rc() is not None and rc != 0
+
+    def path(self, *args):
+        # TODO currently this only handles a single "call"
+        calls = self.meta['calls'].keys()
+        call_name = 'call-' + calls[0].split('.')[-1]
+        exec_dir = self.meta['exec_dir']
+        return os.path.join(exec_dir, call_name, *args)
+
     def stdout(self):
-        return job_output_file(self.id, "stdout")
+        return self.output_file("stdout")
 
-    @property
     def stderr(self):
-        return job_output_file(self.id, "stderr")
+        return self.output_file("stderr")
 
-    @property
     def stdout_tail(self):
-        return tail(self.stdout)
+        return tail(self.stdout())
 
-    @property
     def stderr_tail(self):
-        return tail(self.stderr)
+        return tail(self.stderr())
 
-    @property
+    def events(self):
+        workflow_name = self.meta['workflowName']
+        log_content = self.output_file(workflow_name + '.log')
+        # The ccc/cromwell output doesn't have a proper root element,
+        # so give it one, which makes parsing easier.
+        log_content = '<root>' + log_content + '</root>'
+        events = parse_event_log(log_content)
+        return events
+
     def time(self):
-        return time_taken(self.id, cromwell_events(self.id))
+        parse_format = '%Y-%m-%dT%H:%M:%S'
+
+        try:
+            events = self.events()
+        except IOError:
+            return "No event log"
+
+        submit_event = None
+        exec_event = None
+        end_event = None
+
+        for event in events:
+            if event['MyType'] == 'SubmitEvent':
+                submit_event = event
+            elif event['MyType'] == 'ExecuteEvent':
+                exec_event = event
+            elif event['MyType'] == 'JobTerminatedEvent':
+                end_event = event
+
+        if not exec_event:
+            return
+
+        if not end_event:
+            end_time = datetime.now()
+        else:
+            end_time = datetime.strptime(end_event['EventTime'], parse_format)
+
+        start_time = datetime.strptime(exec_event['EventTime'], parse_format)
+        return end_time - start_time
+
+    def days(self):
+        delta = self.time()
+        if delta:
+            hours = float(delta.seconds) / 60 / 60
+            days = delta.days + hours / 24
+            return '{days:.1f} days'.format(days=days)
+
+    def condor_id(self):
+        return self.condor_info.get('ClusterId', 'Unknown')
+
+    def condor_meta(self):
+        return '\n'.join('{0:<25} = {1}'.format(k, v) for k, v in self.condor_info.items())
 
 
 
-def easy_cli(query, job_ids, condor_jobs_info):
-    format_str = ' '.join('{' + q + '}' for q in query)
+def detect_column_widths(rows):
+    widths = [0 for i in xrange(len(rows[0]))]
+    for row in rows:
+        for i, col in enumerate(row):
+            width = len(col)
+            # Don't bother with wide columns
+            if width < 40:
+                widths[i] = max(widths[i], len(col))
+    return widths
 
-    for job_id in job_ids:
-        job = Job(job_id, condor_jobs_info.get(job_id))
+def format_output_table(rows):
+    string_rows = []
+    for row in rows:
+        string_rows.append([str(col) for col in row])
 
-        if args.only_finished and job.status != "Completed":
-            continue
+    widths = detect_column_widths(string_rows)
+    output = ''
+    for row in string_rows:
+        output += ' '.join(col.ljust(widths[i]) for i, col in enumerate(row))
+        output += '\n'
 
-        data = {k: getattr(job, k, '') for k in query}
-        data.update({
+    return output
+
+
+def easy_cli(query, job_ids, condor_jobs_info, get_meta_func):
+    if query:
+        common = {
             'sep': '\n' + ('=' * 80),
             'nl': '\n',
-        })
-        
-        print format_str.format(**data)
+        }
 
-    if args.status_count:
+        rows = []
+        for job_id in job_ids:
+            cols = []
+            rows.append(cols)
+            meta = get_meta_func(job_id)
+            job = Job(job_id, condor_jobs_info.get(job_id), meta)
+
+            if args.only_finished and job.status() != "Completed":
+                continue
+
+            for q in query:
+                if q in common:
+                    col = common[q]
+                elif hasattr(job, q):
+                    col = getattr(job, q)
+                    if isinstance(col, types.MethodType):
+                        col = col()
+                else:
+                    raise Exception("Unknown query key: {}".format(q))
+
+                cols.append(col)
+            
+        print format_output_table(rows)
+
+    if args.summary:
         print_job_status_summary(job_ids, condor_jobs_info)
 
 
 ################################################################
+
+def get_ccc_metadata(job_id):
+    EXEC_DIR = "/cluster_share/cromwell-executions"
+    meta = exec_engine_api.get_metadata(job_id).json()
+    workflow_name = meta['workflowName']
+    meta['exec_dir'] = os.path.join(EXEC_DIR, workflow_name, job_id)
+    return meta
 
 if __name__ == "__main__":
 
@@ -323,5 +390,6 @@ if __name__ == "__main__":
     job_configs = load_job_configs(args.jobs)
     job_ids = job_configs.keys()
     condor_jobs_info = get_condor_info_by_job()
-    easy_cli(args.query, job_ids, condor_jobs_info)
+
+    easy_cli(args.query, job_ids, condor_jobs_info, get_ccc_metadata)
     #adhoc(job_ids, condor_jobs_info)
