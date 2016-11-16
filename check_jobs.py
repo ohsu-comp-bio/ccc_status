@@ -5,7 +5,7 @@ TODO: this only handles workflows with a single call currently.
 
 import argparse
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 from pprint import pprint
@@ -299,10 +299,12 @@ class Job(object):
 
     def days(self):
         delta = self.time()
-        if delta:
+        if isinstance(delta, timedelta):
             hours = float(delta.seconds) / 60 / 60
             days = delta.days + hours / 24
             return '{days:.1f} days'.format(days=days)
+        else:
+            return delta
 
     def condor_id(self):
         return self.condor_info.get('ClusterId', 'Unknown')
