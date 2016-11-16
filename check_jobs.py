@@ -4,7 +4,7 @@ TODO: this only handles workflows with a single call currently.
 """
 
 import argparse
-from collections import Counter
+from collections import Counter, namedtuple
 from datetime import datetime, timedelta
 import json
 import os
@@ -98,9 +98,6 @@ def tail(string, n=20):
     return "\n".join(lines[-n:])
 
 
-class NoJobOutputFile(Exception): pass
-
-
 def parse_event_log(raw):
     events = []
 
@@ -147,75 +144,22 @@ def print_job_status_summary(job_ids, condor_jobs_info):
 
 
 ################################################################
-# Ad hoc query functions
 
-def print_condor_info_keys():
-    "Prints all the key names of condor job metadata"
-    print "\n".join(get_condor_info()[0].keys())
-
-def print_failed_job_stderr(job_id):
-    rc = job_rc(job_id)
-    if rc is not None and rc != 0:
-        print job_output_file(job_id, "stderr")
-        print tail(job_output_file(job_id, "stdout"), n=10)
-        print '=' * 50
-        print
-
-def print_failed_job_config_path(job_configs):
-    for job_id, config_path in job_configs.items():
-        if did_job_fail(job_id):
-            #print job_id, config_path
-            print config_path
-
-def print_tail_running_jobs(job_id, condor_jobs_info):
-    job_info = condor_jobs_info[job_id]
-    job_status = job_info['JobStatus']
-
-    if job_status == "Running":
-        print tail(job_output_file(job_id, "stdout"), n=10)
-        print "=" * 50
-
-def print_job_metadata(job_id):
-    meta = exec_engine_api.get_metadata(job_id).json()
-    pprint(meta)
-
-def print_all_condor_job_info(job_id, condor_jobs_info):
-    job_info = condor_jobs_info[job_id]
-    for k, v in job_info.items():
-        print k, v
-
-
-def adhoc(job_ids, condor_jobs_info):
-
-    #for jid, info in condor_jobs_info.items():
-    #    print jid, info
-
-    #print_failed_job_config_path(job_configs)
-
-    # A place for non-cli, adhoc queries
-    for job_id in job_ids:
-        #print_job_metadata(job_id)
-        #print_tail_running_jobs(job_id, condor_jobs_info)
-        #print job_output_file(job_id, "Seqware_Sanger_Somatic_Workflow.log")
-        #print_failed_job_stderr(job_id)
-        pass
-
-################################################################
-
-class Job(object):
-    def __init__(self, id, condor_info, meta):
-        self.full_id = id
+class Call(object):
+    def __init__(self, name, id, condor_info, exec_dir):
+        self.name = name
+        self.id = id
         self.condor_info = condor_info or {}
-        self.meta = meta or {}
-
-    def id(self):
-        return self.full_id[:8]
+        self.exec_dir = exec_dir
 
     def status(self):
         return self.condor_info.get('JobStatus', 'Unknown')
 
+    def path(self, *args):
+        return os.path.join(self.exec_dir, *args)
+
     def rc(self):
-        rc_path = self.path(self.full_id, "rc")
+        rc_path = self.path("rc")
         has_rc = os.path.exists(rc_path)
 
         if has_rc:
@@ -238,13 +182,6 @@ class Job(object):
     def failed(self):
         return self.rc() is not None and rc != 0
 
-    def path(self, *args):
-        # TODO currently this only handles a single "call"
-        calls = self.meta['calls'].keys()
-        call_name = 'call-' + calls[0].split('.')[-1]
-        exec_dir = self.meta['exec_dir']
-        return os.path.join(exec_dir, call_name, *args)
-
     def stdout(self):
         return self.output_file("stdout")
 
@@ -258,8 +195,7 @@ class Job(object):
         return tail(self.stderr())
 
     def events(self):
-        workflow_name = self.meta['workflowName']
-        log_content = self.output_file(workflow_name + '.log')
+        log_content = self.output_file(self.name + '.log')
         # The ccc/cromwell output doesn't have a proper root element,
         # so give it one, which makes parsing easier.
         log_content = '<root>' + log_content + '</root>'
@@ -310,7 +246,9 @@ class Job(object):
         return self.condor_info.get('ClusterId', 'Unknown')
 
     def condor_meta(self):
-        return '\n'.join('{0:<25} = {1}'.format(k, v) for k, v in self.condor_info.items())
+        fmt = '{0:<25} = {1}'.format
+        items = self.condor_info.items()
+        return '\n'.join(fmt(k, v) for k, v in items)
 
 
 
@@ -338,7 +276,7 @@ def format_output_table(rows):
     return output
 
 
-def easy_cli(query, job_ids, condor_jobs_info, get_meta_func):
+def easy_cli(query, job_ids, condor_jobs_info):
     if query:
         common = {
             'sep': '\n' + ('=' * 80),
@@ -347,25 +285,26 @@ def easy_cli(query, job_ids, condor_jobs_info, get_meta_func):
 
         rows = []
         for job_id in job_ids:
-            cols = []
-            rows.append(cols)
-            meta = get_meta_func(job_id)
-            job = Job(job_id, condor_jobs_info.get(job_id), meta)
+            for meta in get_ccc_calls_metadata(job_id):
+                cols = []
+                rows.append(cols)
+                call = Call(meta.name, meta.id, condor_jobs_info.get(job_id),
+                            meta.exec_dir)
 
-            if args.only_finished and job.status() != "Completed":
-                continue
+                if args.only_finished and call.status() != "Completed":
+                    continue
 
-            for q in query:
-                if q in common:
-                    col = common[q]
-                elif hasattr(job, q):
-                    col = getattr(job, q)
-                    if isinstance(col, types.MethodType):
-                        col = col()
-                else:
-                    raise Exception("Unknown query key: {}".format(q))
+                for q in query:
+                    if q in common:
+                        col = common[q]
+                    elif hasattr(call, q):
+                        col = getattr(call, q)
+                        if isinstance(col, types.MethodType):
+                            col = col()
+                    else:
+                        raise Exception("Unknown query key: {}".format(q))
 
-                cols.append(col)
+                    cols.append(col)
             
         print format_output_table(rows)
 
@@ -375,12 +314,25 @@ def easy_cli(query, job_ids, condor_jobs_info, get_meta_func):
 
 ################################################################
 
-def get_ccc_metadata(job_id):
+CCC_CallMeta = namedtuple('CCC_CallMeta', 'name id exec_dir')
+
+def get_ccc_calls_metadata(job_id):
     EXEC_DIR = "/cluster_share/cromwell-executions"
+
+    calls = []
     meta = exec_engine_api.get_metadata(job_id).json()
     workflow_name = meta['workflowName']
-    meta['exec_dir'] = os.path.join(EXEC_DIR, workflow_name, job_id)
-    return meta
+
+    for call in meta['calls'].keys():
+        call_name = call.split('.')[-1]
+        call_dir_name = 'call-' + call_name
+        exec_dir = os.path.join(EXEC_DIR, workflow_name, job_id, call_dir_name)
+        call_id = job_id[:8] + ':' + call_name
+        call_meta = CCC_CallMeta(call_name, call_id, exec_dir)
+        calls.append(call_meta)
+
+    return calls
+
 
 if __name__ == "__main__":
 
@@ -393,5 +345,5 @@ if __name__ == "__main__":
     job_ids = job_configs.keys()
     condor_jobs_info = get_condor_info_by_job()
 
-    easy_cli(args.query, job_ids, condor_jobs_info, get_ccc_metadata)
+    easy_cli(args.query, job_ids, condor_jobs_info)
     #adhoc(job_ids, condor_jobs_info)
