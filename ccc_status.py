@@ -262,7 +262,10 @@ def job_status_summary(calls):
         status = call.status()
         counts[status] += 1
 
-    return str(counts)
+    total = sum(counts.values())
+    rows = [k + ' : ' + str(v) for k, v in counts.items()]
+    rows.append('Total : ' + str(total))
+    return '\n'.join(rows)
 
 def detect_column_widths(rows):
     widths = [0 for i in xrange(len(rows[0]))]
