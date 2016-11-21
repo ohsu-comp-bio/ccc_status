@@ -43,7 +43,7 @@ argparser = argparse.ArgumentParser(
     formatter_class=argparse.RawDescriptionHelpFormatter,
 )
 argparser.add_argument("--summary", "-s", action="store_true")
-argparser.add_argument("--only-finished", "-f", action="store_true")
+argparser.add_argument("--filter", "-f", nargs="+")
 argparser.add_argument("--query", "-q", nargs="+")
 argparser.add_argument("jobs", nargs="+")
 
@@ -291,6 +291,13 @@ def format_output_table(rows):
     return output
 
 
+def get_call_attr(call, key):
+    attr = getattr(call, key)
+    if isinstance(attr, types.MethodType):
+        return attr()
+    else:
+        return attr
+    
 def get_query_results(query, calls):
     common_queries = {
         'sep': '\n' + ('=' * 80),
@@ -306,11 +313,7 @@ def get_query_results(query, calls):
             if q in common_queries:
                 col = common_queries[q]
             elif hasattr(call, q):
-                attr = getattr(call, q)
-                if isinstance(attr, types.MethodType):
-                    col = attr()
-                else:
-                    col = attr
+                col = get_call_attr(call, q)
             else:
                 raise Exception("Unknown query key: {}".format(q))
 
@@ -340,6 +343,24 @@ def get_ccc_calls(job_ids, condor_jobs_info):
 
     return calls
 
+def filter_calls(filter_str, calls):
+    filtered = []
+
+    class CallMapping(object):
+        def __init__(self, call):
+            self.call = call
+
+        def __getitem__(self, key):
+            return get_call_attr(self.call, key)
+
+    for call in calls:
+        mapping = CallMapping(call)
+        res = eval(filter_str, None, mapping)
+        if res:
+            filtered.append(call)
+
+    return filtered
+
 
 if __name__ == "__main__":
 
@@ -353,8 +374,9 @@ if __name__ == "__main__":
     condor_jobs_info = get_condor_info_by_job()
     calls = get_ccc_calls(job_ids, condor_jobs_info)
 
-    if args.only_finished:
-        calls = filter_completed(calls)
+    if args.filter:
+        filter_str = ' '.join(args.filter)
+        calls = filter_calls(filter_str, calls)
 
     if args.query:
         print get_query_results(args.query, calls)
