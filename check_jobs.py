@@ -4,7 +4,7 @@ TODO: this only handles workflows with a single call currently.
 """
 
 import argparse
-from collections import Counter, namedtuple
+from collections import Counter
 from datetime import datetime, timedelta
 import json
 import os
@@ -133,24 +133,25 @@ def parse_event_log(raw):
     return events
 
 
-def print_job_status_summary(job_ids, condor_jobs_info):
-    counts = Counter()
-    for job_id in job_ids:
-        job_info = condor_jobs_info[job_id]
-        job_status = job_info['JobStatus']
-        counts[job_status] += 1
-
-    print counts
-
+def filter_completed(calls):
+    return [call for call in calls if call.status() == "Completed"]
 
 ################################################################
 
 class Call(object):
-    def __init__(self, name, id, condor_info, exec_dir):
+    '''
+    Call represents data associated with a workflow call,
+    and is the source of most/all query results.
+    '''
+
+    def __init__(self, name, full_id, condor_info, exec_dir):
         self.name = name
-        self.id = id
+        self.full_id = full_id
         self.condor_info = condor_info or {}
         self.exec_dir = exec_dir
+
+    def id(self):
+        return self.full_id[:8] + ':' + self.name
 
     def status(self):
         return self.condor_info.get('JobStatus', 'Unknown')
@@ -251,6 +252,17 @@ class Call(object):
         return '\n'.join(fmt(k, v) for k, v in items)
 
 
+#######################################################################################
+# Query results formatting
+
+
+def job_status_summary(calls):
+    counts = Counter()
+    for call in calls:
+        status = call.status()
+        counts[status] += 1
+
+    return str(counts)
 
 def detect_column_widths(rows):
     widths = [0 for i in xrange(len(rows[0]))]
@@ -276,60 +288,52 @@ def format_output_table(rows):
     return output
 
 
-def easy_cli(query, job_ids, condor_jobs_info):
-    if query:
-        common = {
-            'sep': '\n' + ('=' * 80),
-            'nl': '\n',
-        }
+def get_query_results(query, calls):
+    common_queries = {
+        'sep': '\n' + ('=' * 80),
+        'nl': '\n',
+    }
 
-        rows = []
-        for job_id in job_ids:
-            for meta in get_ccc_calls_metadata(job_id):
-                cols = []
-                rows.append(cols)
-                call = Call(meta.name, meta.id, condor_jobs_info.get(job_id),
-                            meta.exec_dir)
+    rows = []
+    for call in calls:
+        cols = []
+        rows.append(cols)
 
-                if args.only_finished and call.status() != "Completed":
-                    continue
+        for q in query:
+            if q in common_queries:
+                col = common_queries[q]
+            elif hasattr(call, q):
+                attr = getattr(call, q)
+                if isinstance(attr, types.MethodType):
+                    col = attr()
+                else:
+                    col = attr
+            else:
+                raise Exception("Unknown query key: {}".format(q))
 
-                for q in query:
-                    if q in common:
-                        col = common[q]
-                    elif hasattr(call, q):
-                        col = getattr(call, q)
-                        if isinstance(col, types.MethodType):
-                            col = col()
-                    else:
-                        raise Exception("Unknown query key: {}".format(q))
-
-                    cols.append(col)
-            
-        print format_output_table(rows)
-
-    if args.summary:
-        print_job_status_summary(job_ids, condor_jobs_info)
+            cols.append(col)
+        
+    return format_output_table(rows)
 
 
 ################################################################
+# CCC and CLI specific stuff
 
-CCC_CallMeta = namedtuple('CCC_CallMeta', 'name id exec_dir')
-
-def get_ccc_calls_metadata(job_id):
+def get_ccc_calls(job_ids, condor_jobs_info):
     EXEC_DIR = "/cluster_share/cromwell-executions"
 
     calls = []
-    meta = exec_engine_api.get_metadata(job_id).json()
-    workflow_name = meta['workflowName']
+    for job_id in job_ids:
+        meta = exec_engine_api.get_metadata(job_id).json()
+        workflow_name = meta['workflowName']
+        condor_info = condor_jobs_info.get(job_id)
 
-    for call in meta['calls'].keys():
-        call_name = call.split('.')[-1]
-        call_dir_name = 'call-' + call_name
-        exec_dir = os.path.join(EXEC_DIR, workflow_name, job_id, call_dir_name)
-        call_id = job_id[:8] + ':' + call_name
-        call_meta = CCC_CallMeta(call_name, call_id, exec_dir)
-        calls.append(call_meta)
+        for call in meta['calls'].keys():
+            call_name = call.split('.')[-1]
+            call_dir_name = 'call-' + call_name
+            exec_dir = os.path.join(EXEC_DIR, workflow_name, job_id, call_dir_name)
+            call = Call(call_name, job_id, condor_info, exec_dir)
+            calls.append(call)
 
     return calls
 
@@ -344,6 +348,13 @@ if __name__ == "__main__":
     job_configs = load_job_configs(args.jobs)
     job_ids = job_configs.keys()
     condor_jobs_info = get_condor_info_by_job()
+    calls = get_ccc_calls(job_ids, condor_jobs_info)
 
-    easy_cli(args.query, job_ids, condor_jobs_info)
-    #adhoc(job_ids, condor_jobs_info)
+    if args.only_finished:
+        calls = filter_completed(calls)
+
+    if args.query:
+        print get_query_results(args.query, calls)
+
+    if args.summary:
+        print job_status_summary(calls)
